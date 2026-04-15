@@ -1,0 +1,18 @@
+apoptotic_manager:
+  ros__parameters:
+    ttl_seconds: 86400
+    kl_threshold: 0.05
+    early_expire_on_drift: true
+    stop_type: velocity_ramp
+drift_observer:
+  ros__parameters:
+    kl_threshold: 0.05
+    sample_rate: 100
+    early_expire_on_drift: true
+safe_stop_controller:
+  ros__parameters:
+    stop_type: velocity_ramp
+    ramp_duration_seconds: 5.0
+checkpoint_registry:
+  ros__parameters:
+    checkpoint_dir: C:/opt/apoptotic/checkpoints

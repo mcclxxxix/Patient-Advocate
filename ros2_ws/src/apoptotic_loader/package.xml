@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>apoptotic_loader</name>
+  <version>1.0.0</version>
+  <description>Programmed cell death for machine intelligence.</description>
+  <maintainer email="craig.mcclurkin@louisville.edu">Craig McClurkin</maintainer>
+  <license>Apache-2.0</license>
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <export><build_type>ament_python</build_type></export>
+</package>
