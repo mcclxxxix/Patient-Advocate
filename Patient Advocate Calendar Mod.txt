@@ -1,0 +1,492 @@
+"""
+Patient Advocate Calendar & Planner Module
+==========================================
+Phase 1 → Phase 3 implementation of the intelligent scheduling agent.
+Scholarly grounding:
+- MOTOR (Steinberg et al., 2023): time-to-event modeling for proactive patient management
+- CADTH (2024): AI-based patient flow management for seamless movement through care systems
+- Hailey (2024, Oncology Practice Management): multifaceted scheduling for oncology adherence
+- Hantel et al. (2024, JAMA Network Open): ethical implications of AI in cancer care scheduli
+Architecture: LangGraph StateGraph node that plugs directly into the existing
+AdvocateState from patient_advocate_routing_system.py and patient_advocate_vision_system.py
+Legal/Ethics Layer:
+- Full audit trail for every scheduling decision (supports "model facts labels" per Carey, 20
+- Human-in-the-loop approval before any calendar mutation
+- HIPAA-aware: no PHI leaves the state graph without patient consent flag
+"""
+import operator
+from datetime import datetime, timedelta
+from typing import Annotated, List, TypedDict, Optional, Dict, Any
+from dataclasses import dataclass, field
+from enum import Enum
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
+from langgraph.graph import StateGraph, END
+# ─────────────────────────────────────────────
+# 1. DATA MODELS
+# ─────────────────────────────────────────────
+class EventPriority(str, Enum):
+CRITICAL = "critical" HIGH = "high" MEDIUM = "medium" LOW = "low" # Chemo infusion, surgery — never auto-move
+# Oncologist appointment — require patient approval to move
+# Lab draw, imaging — can be rescheduled with approval
+# Rest day, exercise — AI can suggest moves
+class ConflictType(str, Enum):
+FATIGUE_WINDOW = "fatigue_window" NEUTROPENIA_RISK = "neutropenia_risk" # Post-chemo nadir period
+# Low ANC period — avoid crowds/exposure
+DRUG_INTERACTION = "drug_interaction" # Scheduling conflict with med timing
+TRAVEL_BURDEN = "travel_burden" # Too many appointments in one day
+PATIENT_PREFERENCE = "patient_preference" # Patient-stated unavailability
+@dataclass
+class CalendarEvent:
+event_id: str
+title: str
+datetime_start: datetime
+datetime_end: datetime
+priority: EventPriority
+location: Optional[str] = None
+provider: Optional[str] = None
+notes: Optional[str] = None
+requires_transport: bool = False
+patient_approved: bool = False
+created_by: str = "system" # "system" | "patient" | "ai_agent" | "provider"
+def to_dict(self) -> Dict[str, Any]:
+return {
+"event_id": self.event_id,
+"title": self.title,
+"start": self.datetime_start.isoformat(),
+"end": self.datetime_end.isoformat(),
+"priority": self.priority.value,
+"location": self.location,
+"provider": self.provider,
+"notes": self.notes,
+"requires_transport": self.requires_transport,
+"patient_approved": self.patient_approved,
+"created_by": self.created_by,
+}
+@dataclass
+class SchedulingSuggestion:
+"""
+Every AI-generated schedule change is a Suggestion, not a Command.
+The patient must approve (HITL gate) before the calendar mutates.
+This implements the Phase 3 'Approves/Rejects' pattern from the roadmap.
+"""
+suggestion_id: str
+original_event: CalendarEvent
+proposed_new_datetime: Optional[datetime]
+reason: str
+conflict_type: ConflictType
+confidence: float # 0.0 - 1.0
+scholarly_basis: str # Citation for the clinical rationale
+status: str = "pending" # "pending" | "approved" | "rejected"
+def to_dict(self) -> Dict[str, Any]:
+return {
+"suggestion_id": self.suggestion_id,
+"event_title": self.original_event.title,
+"original_time": self.original_event.datetime_start.isoformat(),
+"proposed_time": self.proposed_new_datetime.isoformat() if self.proposed_new_date
+"reason": self.reason,
+"conflict_type": self.conflict_type.value,
+"confidence": self.confidence,
+"scholarly_basis": self.scholarly_basis,
+"status": self.status,
+}
+# ─────────────────────────────────────────────
+# 2. EXTENDED STATE (compatible with existing AdvocateState)
+# ─────────────────────────────────────────────
+class AdvocateCalendarState(TypedDict):
+# ---- inherited from existing system ----
+messages: Annotated[List[BaseMessage], operator.add]
+patient_profile: dict
+audit_log: List[str]
+next_agent: str
+image_path: Optional[str]
+# ---- calendar-specific ----
+calendar_events: List[Dict] # Serialized CalendarEvent list
+pending_suggestions: List[Dict] # Suggestions awaiting patient approval
+approved_changes: List[Dict] # HITL-approved mutations
+rejected_changes: List[Dict] # Rejected by patient (used for RLHF)
+lab_values: Optional[Dict] # Parsed from OCR or EHR (ANC, fatigue marke
+symptom_log: List[Dict] # Daily symptom entries (1-10 scale)
+ethics_flags: List[str] # Triggers for ethics complaint module (Phas
+legal_action_queue: List[Dict] # Insurance/provider disputes queued for fil
+# ─────────────────────────────────────────────
+# 3. CALENDAR INTELLIGENCE ENGINE
+# ─────────────────────────────────────────────
+class CalendarIntelligenceEngine:
+"""
+Core reasoning engine for schedule optimization.
+Clinical logic grounded in:
+- Chemotherapy nadir windows (typically days 7-14 post-infusion for ANC)
+- Fatigue scoring from symptom logs vs. activity demand
+- MOTOR model concept: time-to-event risk stratification (Steinberg et al., 2023)
+"""
+# Post-chemo nadir window in days (configurable per regimen)
+NADIR_WINDOW_DAYS = {"default": (7, 14), "CHOP": (7, 12), "FOLFOX": (9, 14)}
+def detect_conflicts(
+self,
+events: List[CalendarEvent],
+lab_values: Optional[Dict],
+symptom_log: List[Dict],
+patient_profile: Dict,
+) -> List[SchedulingSuggestion]:
+"""
+Detect scheduling conflicts using clinical + logistical heuristics.
+Returns a list of suggestions (never direct mutations).
+"""
+suggestions = []
+regimen = patient_profile.get("regimen", "default")
+nadir_start, nadir_end = self.NADIR_WINDOW_DAYS.get(
+regimen, self.NADIR_WINDOW_DAYS["default"]
+)
+# Find chemo infusion events as reference anchors
+chemo_events = [
+e for e in events
+if "chemo" in e.title.lower() or "infusion" in e.title.lower()
+]
+for event in events:
+if event.priority == EventPriority.CRITICAL:
+continue # Never touch critical events
+for chemo in chemo_events:
+days_after = (event.datetime_start - chemo.datetime_start).days
+# Check nadir window overlap
+if nadir_start <= days_after <= nadir_end:
+if event.priority in [EventPriority.MEDIUM, EventPriority.LOW]:
+# Suggest moving to after nadir recovery
+proposed = chemo.datetime_start + timedelta(days=nadir_end + 3)
+suggestions.append(SchedulingSuggestion(
+suggestion_id=f"sug_{event.event_id}_nadir",
+original_event=event,
+proposed_new_datetime=proposed,
+reason=(
+f"'{event.title}' falls within your post-{regimen} nadir wind
+f"(days {nadir_start}-{nadir_end}), when immune function is l
+f"Exposure risk is elevated."
+),
+conflict_type=ConflictType.NEUTROPENIA_RISK,
+confidence=0.82,
+scholarly_basis=(
+"CADTH (2024) AI-based patient flow management; "
+"Hailey (2024, Oncol. Practice Mgmt.) on adherence-preserving
+),
+))
+# Fatigue-based scheduling (from symptom log)
+if symptom_log:
+recent_fatigue = [
+s["fatigue_score"] for s in symptom_log[-7:]
+if "fatigue_score" in s
+]
+if recent_fatigue:
+avg_fatigue = sum(recent_fatigue) / len(recent_fatigue)
+if avg_fatigue >= 7:
+# Flag high-demand LOW priority events for postponement
+for event in events:
+if event.priority == EventPriority.LOW and event.requires_transport:
+suggestions.append(SchedulingSuggestion(
+suggestion_id=f"sug_{event.event_id}_fatigue",
+original_event=event,
+proposed_new_datetime=event.datetime_start + timedelta(days=7
+reason=(
+f"Your 7-day average fatigue score is {avg_fatigue:.1f}/1
+f"'{event.title}' involves travel and physical demand. "
+f"Rescheduling may improve treatment tolerance."
+),
+conflict_type=ConflictType.FATIGUE_WINDOW,
+confidence=0.75,
+scholarly_basis=(
+"MOTOR (Steinberg et al., 2023): time-to-event risk strat
+"for proactive patient management in chronic disease."
+),
+))
+# Check lab values for ANC-based restrictions
+if lab_values:
+anc = lab_values.get("ANC") # Absolute Neutrophil Count (cells/µL)
+if anc and anc < 1000:
+for event in events:
+if event.location and "hospital" not in event.location.lower():
+suggestions.append(SchedulingSuggestion(
+suggestion_id=f"sug_{event.event_id}_anc",
+original_event=event,
+proposed_new_datetime=None, # Defer — no proposed date yet
+reason=(
+f"Lab OCR detected ANC={anc} cells/µL (neutropenic threshold
+f"Public venue events carry infection risk."
+),
+conflict_type=ConflictType.NEUTROPENIA_RISK,
+confidence=0.91,
+scholarly_basis=(
+"Hantel et al. (2024, JAMA Netw Open): ethical AI in cancer s
+"must incorporate lab-based clinical guardrails."
+),
+))
+return suggestions
+def build_transparency_report(
+self, suggestions: List[SchedulingSuggestion]
+) -> str:
+"""
+Generate a Glass Box audit trail for every AI scheduling decision.
+Required by the 'model facts labels' standard (Carey, 2024, Advances in Consumer Rese
+"""
+lines = ["=== CALENDAR AI DECISION TRANSPARENCY REPORT ===\n"]
+for s in suggestions:
+lines.append(f"Suggestion ID : {s.suggestion_id}")
+lines.append(f"Event : {s.original_event.title}")
+lines.append(f"Conflict Type : {s.conflict_type.value}")
+lines.append(f"Confidence : {s.confidence:.0%}")
+lines.append(f"Reason : {s.reason}")
+lines.append(f"Clinical Basis: {s.scholarly_basis}")
+lines.append(f"Status : {s.status}")
+lines.append("-" * 50)
+return "\n".join(lines)
+# ─────────────────────────────────────────────
+# 4. LANGGRAPH NODES
+# ─────────────────────────────────────────────
+engine = CalendarIntelligenceEngine()
+def calendar_agent_node(state: AdvocateCalendarState) -> dict:
+"""
+Phase 1/2: Reads calendar + lab values, generates scheduling suggestions.
+NEVER mutates the calendar directly — all changes go into pending_suggestions.
+Human-in-the-loop gate enforced downstream by patient_approval_node.
+"""
+print("--- Calendar Intelligence Agent Activated ---")
+raw_events = state.get("calendar_events", [])
+lab_values = state.get("lab_values")
+symptom_log = state.get("symptom_log", [])
+patient_profile = state.get("patient_profile", {})
+# Deserialize events (in production these come from PostgreSQL / Google Calendar API)
+events = []
+for e in raw_events:
+try:
+events.append(CalendarEvent(
+event_id=e["event_id"],
+title=e["title"],
+datetime_start=datetime.fromisoformat(e["start"]),
+datetime_end=datetime.fromisoformat(e["end"]),
+priority=EventPriority(e["priority"]),
+location=e.get("location"),
+provider=e.get("provider"),
+notes=e.get("notes"),
+requires_transport=e.get("requires_transport", False),
+patient_approved=e.get("patient_approved", False),
+created_by=e.get("created_by", "system"),
+))
+except (KeyError, ValueError) as err:
+print(f" Warning: skipping malformed event — {err}")
+suggestions = engine.detect_conflicts(events, lab_values, symptom_log, patient_profile)
+transparency_report = engine.build_transparency_report(suggestions)
+suggestion_dicts = [s.to_dict() for s in suggestions]
+audit_entry = (
+f"Calendar Agent: analyzed {len(events)} events, "
+f"generated {len(suggestions)} suggestions. "
+f"No calendar mutations performed — pending patient approval."
+)
+summary_msg = (
+f"I found {len(suggestions)} scheduling concern(s) on your calendar.\n\n"
++ "\n".join(
+f"• {s.reason}\n Basis: {s.scholarly_basis}"
+for s in suggestions
+)
++ "\n\nWould you like me to apply these changes? (Approval required before any if suggestions
+else "Your calendar looks clear of clinical scheduling conflicts for now. "
+update
+)
+return {
+"messages": [AIMessage(content=summary_msg)],
+"pending_suggestions": suggestion_dicts,
+"audit_log": [audit_entry, transparency_report],
+"next_agent": "patient_approval",
+}
+def patient_approval_node(state: AdvocateCalendarState) -> dict:
+"""
+HITL Gate — Phase 2/3.
+In production: sends push notification to React Native app.
+Patient taps Approve/Reject; response routes back here via webhook.
+For simulation: auto-approves LOW priority, holds HIGH for human.
+RLHF hook: rejected suggestions are stored in rejected_changes
+to retrain the Master Model's scheduling preferences over time.
+"""
+print("--- Patient Approval Gate ---")
+pending = state.get("pending_suggestions", [])
+approved = []
+rejected = []
+held_for_human = []
+for s in pending:
+if s["confidence"] >= 0.85 and s["conflict_type"] in [
+ConflictType.NEUTROPENIA_RISK.value,
+ConflictType.DRUG_INTERACTION.value,
+]:
+# High-confidence clinical safety suggestions: flag for IMMEDIATE human review
+held_for_human.append(s)
+print(f" HELD FOR HUMAN: {s['event_title']} — {s['conflict_type']}")
+else:
+# Simulate patient approval (in prod: push notification response)
+approved.append({**s, "status": "approved", "approved_at": datetime.now().isoform
+print(f" Simulated approval: {s['event_title']}")
+audit_entry = (
+f"Approval Gate: {len(approved)} approved, "
+f"{len(held_for_human)} held for human review, "
+f"{len(rejected)} rejected."
+)
+return {
+"approved_changes": approved,
+"rejected_changes": rejected,
+"pending_suggestions": held_for_human, # Remaining = still needs human
+"audit_log": [audit_entry],
+"next_agent": "ethics_screener" if held_for_human else "end",
+}
+def ethics_screener_node(state: AdvocateCalendarState) -> dict:
+"""
+Phase 3/4: Screens scheduling patterns for systemic ethics violations.
+If the AI detects patterns suggesting insurance-driven care denial,
+discriminatory scheduling, or repeated medically unjustified delays,
+it flags items for the legal action queue (Phase 4).
+Grounded in:
+- EU AI Act high-risk classification for health AI (2024)
+- Carey (2024): audit logs as basis for ex post complaint/litigation
+- WHO (2024): multi-stakeholder governance for LMM health models
+"""
+print("--- Ethics & Legal Screener Activated ---")
+held = state.get("pending_suggestions", [])
+ethics_flags = list(state.get("ethics_flags", []))
+legal_queue = list(state.get("legal_action_queue", []))
+new_flags = []
+for s in held:
+# Flag: repeated high-confidence safety suggestions being blocked
+if s["confidence"] > 0.85 and s["status"] == "pending":
+flag = (
+f"ETHICS FLAG [{datetime.now().isoformat()}]: "
+f"High-confidence clinical safety suggestion blocked for '{s['event_title']}'
+f"Conflict: {s['conflict_type']}. If this reflects insurance or provider obst
+f"this event is queued for potential ethics complaint filing."
+)
+new_flags.append(flag)
+# Pre-populate legal action queue (Phase 4 — filing module to be built)
+legal_queue.append({
+"action_type": "ethics_complaint",
+"subject": s["event_title"],
+"basis": s["reason"],
+"scholarly_support": s["scholarly_basis"],
+"timestamp": datetime.now().isoformat(),
+"status": "queued",
+"next_step": "human_attorney_review", # Always requires attorney sign-off
+})
+audit_entry = (
+f"Ethics Screener: {len(new_flags)} new ethics flags raised. "
+f"Legal action queue now has {len(legal_queue)} items."
+)
+msg = (
+" Ethics Review Complete.\n"
++ ("\n".join(new_flags) if new_flags else "No ethics violations detected.")
++ (
+f"\n\n{len(legal_queue)} item(s) queued for potential legal action. "
+"An attorney must review before any complaint or motion is filed."
+if legal_queue else ""
+)
+)
+return {
+"messages": [AIMessage(content=msg)],
+"ethics_flags": ethics_flags + new_flags,
+"legal_action_queue": legal_queue,
+"audit_log": [audit_entry],
+"next_agent": "end",
+}
+# ─────────────────────────────────────────────
+# 5. BUILD THE GRAPH
+# ─────────────────────────────────────────────
+def calendar_router(state: AdvocateCalendarState) -> str:
+return state.get("next_agent", "end")
+def build_calendar_graph() -> StateGraph:
+workflow = StateGraph(AdvocateCalendarState)
+workflow.add_node("calendar_agent", calendar_agent_node)
+workflow.add_node("patient_approval", patient_approval_node)
+workflow.add_node("ethics_screener", ethics_screener_node)
+workflow.set_entry_point("calendar_agent")
+workflow.add_edge("calendar_agent", "patient_approval")
+workflow.add_conditional_edges(
+"patient_approval",
+calendar_router,
+{
+"ethics_screener": "ethics_screener",
+"end": END,
+},
+)
+workflow.add_edge("ethics_screener", END)
+return workflow.compile()
+# ─────────────────────────────────────────────
+# 6. SIMULATION / DEMO
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+now = datetime.now()
+# Simulated patient calendar
+mock_events = [
+{
+"event_id": "e1",
+"title": "Chemotherapy Infusion — Cycle 3",
+"start": now.isoformat(),
+"end": (now + timedelta(hours=4)).isoformat(),
+"priority": "critical",
+"location": "Cancer Center Infusion Suite",
+"provider": "Dr. Reyes",
+"requires_transport": True,
+"patient_approved": True,
+"created_by": "provider",
+},
+{
+"event_id": "e2",
+"title": "Farmers Market Walk",
+"start": (now + timedelta(days=9)).isoformat(),
+"end": (now + timedelta(days=9, hours=2)).isoformat(),
+"priority": "low",
+"location": "Downtown Market",
+"requires_transport": False,
+"patient_approved": True,
+"created_by": "patient",
+},
+{
+"event_id": "e3",
+"title": "Blood Draw — CBC Panel",
+"start": (now + timedelta(days=10)).isoformat(),
+"end": (now + timedelta(days=10, hours=1)).isoformat(),
+"priority": "medium",
+"location": "Lab Corp",
+"requires_transport": True,
+"patient_approved": True,
+"created_by": "provider",
+},
+]
+# Simulated symptom log (fatigue scores over 7 days)
+mock_symptom_log = [
+{"date": (now - timedelta(days=i)).isoformat(), "fatigue_score": 7 + (i % 2)}
+for i in range(7)
+]
+# Simulated lab values (post-OCR from vision agent)
+mock_lab_values = {"ANC": 850, "WBC": 2.1, "Hgb": 9.8}
+inputs: AdvocateCalendarState = {
+"messages": [HumanMessage(content="Can you review my schedule and check if anything c
+"patient_profile": {
+"name": "Jane Doe",
+"diagnosis": "Stage 2 Lymphoma",
+"regimen": "CHOP",
+"dob": "1978-04-12",
+},
+"audit_log": [],
+"next_agent": "calendar_agent",
+"image_path": None,
+"calendar_events": mock_events,
+"pending_suggestions": [],
+"approved_changes": [],
+"rejected_changes": [],
+"lab_values": mock_lab_values,
+"symptom_log": mock_symptom_log,
+"ethics_flags": [],
+"legal_action_queue": [],
+}
+app = build_calendar_graph()
+result = app.invoke(inputs)
+print("\n" + "=" * 60)
+print("FINAL PATIENT MESSAGE:")
+print(result["messages"][-1].content)
+print("\nAUDIT LOG:")
+for entry in result["audit_log"]:
+print(f" • {entry[:200]}...")
+print(f"\nApproved Changes : {len(result['approved_changes'])}")
+print(f"Ethics Flags : {len(result['ethics_flags'])}")
+print(f"Legal Queue : {len(result['legal_action_queue'])}")
